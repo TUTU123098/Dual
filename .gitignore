@@ -1,0 +1,13 @@
+outmodel/
+results/
+data/
+*.pt
+*.log
+wget-log
+outlog/
+outcache/
+outpred/
+*.bak
+__pycache__/
+*.pyc
+esm2_t33_650M_UR50D/
