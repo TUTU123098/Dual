@@ -45,11 +45,11 @@ ESM_CACHE_TEST  = f"outcache/esm_{DATASET}_fold{FOLD}_test.npz"
 SEED = 42
 BATCH_SIZE = 32
 LR = 1e-3
-EPOCHS = 70
-WARMUP_EPOCHS = max(3, int(0.1 * EPOCHS))
+EPOCHS = 80
+WARMUP_EPOCHS = max(5, int(0.08 * EPOCHS))
 
-# ── AnOxPePred 用更长的 patience，其他数据集用 12 ──
-PATIENCE = 20 if DATASET == 'AnOxPePred' else 12
+# ── AnOxPePred 用更长的 patience，其他数据集用 15 ──
+PATIENCE = 25 if DATASET == 'AnOxPePred' else 15
 
 MODEL_DIM = 256
 
@@ -74,27 +74,35 @@ GT_LAYERS = 3
 HEADS_GT  = 4
 
 # ── AnOxPePred 用更大的 dropout 防止小数据过拟合 ──
-DROPOUT      = 0.35 if DATASET == 'AnOxPePred' else 0.2
-WEIGHT_DECAY = 2e-4 if DATASET == 'AnOxPePred' else 1e-4
+DROPOUT      = 0.40 if DATASET == 'AnOxPePred' else 0.20
+WEIGHT_DECAY = 3e-4 if DATASET == 'AnOxPePred' else 1e-4
 
 W2V_WINDOW = 2
 W2V_EPOCHS = 20
 W2V_MIN_COUNT = 1
 USE_FOCAL = True
-FOCAL_GAMMA = 1.5
+FOCAL_GAMMA = 2.0
 
 SMOOTH_EPS    = 0.05
-MIXUP_PROB    = 0.20
+MIXUP_PROB    = 0.25
 MIXUP_ALPHA   = 0.20
 DROP_PATH_P   = 0.10
+TOKEN_DROP_P  = 0.10  # Bigram token dropout 概率
 
-MIN_SP_FOR_THR = 0.45   # ← 略微放宽，让阈值搜索空间更大
+MIN_SP_FOR_THR = 0.40   # 放宽，让阈值搜索空间更大（所有数据集都搜索）
 T_MIN, T_MAX   = 0.5, 2.5
 
 N_MC_TEST = 20
 MC_DISABLE_DROPEDGE = True
 
 EMA_DECAY = 0.999
+
+# SWA 设置
+SWA_START_RATIO = 0.75   # 从第 75% epoch 开始 SWA
+SWA_LR = 1e-4
+
+# R-Drop 权重
+RDROP_ALPHA = 4.0 if DATASET == 'AnOxPePred' else 2.0
 
 USE_CONST_LR = True
 # ── AnOxPePred 用更小的学习率 ──
@@ -184,13 +192,45 @@ def load_esm(model_name=ESM_MODEL_NAME, trainable=ESM_TRAINABLE):
         model.eval()
     return model, alphabet
 
+def load_esmfold():
+    """加载 ESMFold 用于 3D 结构预测"""
+    try:
+        import esm
+    except ImportError as e:
+        raise ImportError("未找到 esm 库，请先安装：pip install fair-esm") from e
+    model = esm.pretrained.esmfold_v1()
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad = False
+    return model
+
+def predict_structure_batch(esmfold_model, sequences: List[str], device):
+    """批量预测 3D 结构（返回 Cα 坐标）"""
+    with torch.no_grad():
+        results = []
+        for seq in sequences:
+            seq = ''.join([c for c in seq if c in AMINO])[:SEQ_MAX_LEN]
+            if len(seq) == 0:
+                results.append(None)
+                continue
+            try:
+                output = esmfold_model.infer_pdb(seq)
+                # 提取 Cα 坐标（简化：只取前 SEQ_MAX_LEN 个残基）
+                coords = output['positions'][-1, :, 1, :]  # [L, 3] Cα atoms
+                coords = coords[:SEQ_MAX_LEN]
+                results.append(coords.cpu().numpy())
+            except:
+                results.append(None)
+    return results
+
 # =========================
 # 数据集
 # =========================
 class GraphSeqDataset(torch.utils.data.Dataset):
     def __init__(self, df: pd.DataFrame, compounds, edges, y, tok2idx: dict,
                  esm_tok_to_idx: dict, esm_pad_idx: int, esm_bos_idx: int, esm_eos_idx: int,
-                 res_emb: Optional[np.ndarray] = None, res_len: Optional[np.ndarray] = None):
+                 res_emb: Optional[np.ndarray] = None, res_len: Optional[np.ndarray] = None,
+                 coords_3d: Optional[List] = None):
         assert len(df) == len(compounds) == len(edges) == len(y), \
             f'数据条数不一致: csv={len(df)}, comp={len(compounds)}, edges={len(edges)}, y={len(y)}'
         self.df = df.reset_index(drop=True)
@@ -206,6 +246,8 @@ class GraphSeqDataset(torch.utils.data.Dataset):
         self.esm_eos_idx = esm_eos_idx
         self.res_emb = res_emb
         self.res_len = res_len
+        self.coords_3d = coords_3d  # 新增 3D 坐标
+        self.training_mode = False  # 由训练循环控制
 
     def __len__(self):
         return len(self.df)
@@ -213,6 +255,10 @@ class GraphSeqDataset(torch.utils.data.Dataset):
     def encode_seq_tokens(self, seq: str) -> torch.Tensor:
         toks = to_bigrams(seq)
         toks = pad_or_trim(toks, BIGRAM_LEN, self.PAD)
+        # token dropout：训练时随机把部分 token 替换为 UNK
+        if self.training_mode and TOKEN_DROP_P > 0:
+            toks = [self.UNK if (t != self.PAD and random.random() < TOKEN_DROP_P) else t
+                    for t in toks]
         ids = [self.tok2idx.get(t, self.tok2idx.get(self.UNK, 0)) for t in toks]
         return torch.tensor(ids, dtype=torch.long)
 
@@ -261,6 +307,32 @@ class GraphSeqDataset(torch.utils.data.Dataset):
             esm_ids, esm_len = self.encode_esm_tokens(seq)
             data.esm_ids = esm_ids
             data.esm_len = esm_len
+
+        # 加入 3D 坐标
+        if self.coords_3d is not None and self.coords_3d[idx] is not None:
+            coords = self.coords_3d[idx]  # [L, 3]
+            L = coords.shape[0]
+            # Pad to SEQ_MAX_LEN
+            if L < SEQ_MAX_LEN:
+                pad = np.zeros((SEQ_MAX_LEN - L, 3), dtype=np.float32)
+                coords = np.concatenate([coords, pad], axis=0)
+            else:
+                coords = coords[:SEQ_MAX_LEN]
+            data.coords_3d = torch.from_numpy(coords).float()
+            # 构建 k-NN 边（简化：全连接前 k 个残基）
+            k = min(10, L)
+            edges_3d = []
+            for i in range(L):
+                for j in range(max(0, i-k), min(L, i+k+1)):
+                    if i != j:
+                        edges_3d.append([i, j])
+            if len(edges_3d) > 0:
+                data.edge_index_3d = torch.tensor(edges_3d, dtype=torch.long).t()
+            else:
+                data.edge_index_3d = torch.empty((2, 0), dtype=torch.long)
+        else:
+            data.coords_3d = torch.zeros(SEQ_MAX_LEN, 3, dtype=torch.float32)
+            data.edge_index_3d = torch.empty((2, 0), dtype=torch.long)
 
         return data
 
@@ -467,24 +539,31 @@ class ESMSeqEncoder(nn.Module):
         return h, seq_vec, mask
 
 # =========================
-# Bigram ConvNeXt 序列编码器
+# xLSTM 序列编码器（替换 ConvNeXt）
 # =========================
-class ConvNeXtBlock(nn.Module):
+class xLSTMBlock(nn.Module):
+    """简化版 xLSTM：门控 LSTM + 指数门控"""
     def __init__(self, dim: int, dropout: float):
         super().__init__()
-        self.dw   = nn.Conv1d(dim, dim, kernel_size=7, padding=3, groups=dim)
+        self.lstm = nn.LSTM(dim, dim, batch_first=True, bidirectional=False)
+        self.gate = nn.Sequential(
+            nn.Linear(dim, dim), nn.Sigmoid()
+        )
         self.norm = nn.LayerNorm(dim)
-        self.mlp  = nn.Sequential(
+        self.ffn = nn.Sequential(
             nn.Linear(dim, 4 * dim), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(4 * dim, dim), nn.Dropout(dropout)
         )
 
     def forward(self, x):
-        y = self.dw(x.transpose(1, 2)).transpose(1, 2)
-        y = self.norm(y)
-        return self.mlp(y) + x
+        # x: [B, L, d]
+        h, _ = self.lstm(x)
+        g = self.gate(h)
+        h = h * g  # 门控
+        h = self.norm(h + x)
+        return self.norm(h + self.ffn(h))
 
-class ConvNeXtSequenceEncoder(nn.Module):
+class xLSTMSequenceEncoder(nn.Module):
     def __init__(self, emb_matrix: np.ndarray, d_model: int = MODEL_DIM, dropout: float = DROPOUT):
         super().__init__()
         num_vocab, emb_dim = emb_matrix.shape
@@ -495,7 +574,7 @@ class ConvNeXtSequenceEncoder(nn.Module):
         self.input_proj = nn.Sequential(
             nn.Linear(emb_dim, d_model), nn.LayerNorm(d_model), nn.GELU(), nn.Dropout(dropout)
         )
-        self.blocks    = nn.ModuleList([ConvNeXtBlock(d_model, dropout) for _ in range(4)])
+        self.blocks    = nn.ModuleList([xLSTMBlock(d_model, dropout) for _ in range(3)])
         self.attn_pool = nn.Linear(d_model, 1)
         self.norm      = nn.LayerNorm(d_model)
         self.drop      = nn.Dropout(dropout)
@@ -509,6 +588,103 @@ class ConvNeXtSequenceEncoder(nn.Module):
         w = torch.softmax(self.attn_pool(x), dim=1)
         s_vec = (x * w).sum(dim=1)
         return x, s_vec
+
+# =========================
+# EGNN 3D 结构编码器
+# =========================
+class EGNNLayer(nn.Module):
+    """等变图神经网络层（处理 3D 坐标）"""
+    def __init__(self, dim: int, edge_dim: int = 0):
+        super().__init__()
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(dim * 2 + edge_dim + 1, dim), nn.SiLU(),
+            nn.Linear(dim, dim), nn.SiLU()
+        )
+        self.node_mlp = nn.Sequential(
+            nn.Linear(dim * 2, dim), nn.SiLU(),
+            nn.Linear(dim, dim)
+        )
+        self.coord_mlp = nn.Sequential(
+            nn.Linear(dim, dim), nn.SiLU(),
+            nn.Linear(dim, 1, bias=False)
+        )
+
+    def forward(self, h, coords, edge_index):
+        # h: [N, d], coords: [N, 3], edge_index: [2, E]
+        row, col = edge_index
+        coord_diff = coords[row] - coords[col]  # [E, 3]
+        radial = torch.sum(coord_diff ** 2, dim=1, keepdim=True)  # [E, 1]
+
+        edge_feat = torch.cat([h[row], h[col], radial], dim=-1)  # [E, 2d+1]
+        edge_msg = self.edge_mlp(edge_feat)  # [E, d]
+
+        # 更新坐标（等变）
+        coord_weight = self.coord_mlp(edge_msg)  # [E, 1]
+        coord_diff_weighted = coord_diff * coord_weight
+        coords_new = coords.clone()
+        coords_new.index_add_(0, row, coord_diff_weighted)
+
+        # 更新节点特征
+        agg = torch.zeros_like(h)
+        agg.index_add_(0, row, edge_msg)
+        h_new = self.node_mlp(torch.cat([h, agg], dim=-1))
+        return h_new + h, coords_new
+
+class StructureEncoder(nn.Module):
+    """ESMFold 3D 结构编码器（EGNN）"""
+    def __init__(self, d_model: int = MODEL_DIM):
+        super().__init__()
+        self.node_proj = nn.Linear(3, d_model)  # 坐标 → 特征
+        self.egnn_layers = nn.ModuleList([EGNNLayer(d_model) for _ in range(3)])
+        self.norm = nn.LayerNorm(d_model)
+        self.attn_pool = nn.Linear(d_model, 1)
+
+    def forward(self, coords_batch: torch.Tensor, batch_idx: torch.Tensor, edge_index_3d_list):
+        """
+        coords_batch: [B*L, 3] - PyG batched 坐标（已经被 DataLoader flatten）
+        batch_idx: [B*L] - 每个残基属于哪个样本
+        edge_index_3d_list: 边索引（需要处理 batch offset）
+        """
+        B = int(batch_idx.max().item()) + 1
+        device = coords_batch.device
+        
+        # 如果 coords 是 [B, L, 3]，需要 flatten
+        if coords_batch.dim() == 3:
+            coords_batch = coords_batch.view(-1, 3)
+        
+        # 构建全局边索引（每个样本的边索引需要偏移）
+        # 简化：使用 k-NN 边（每个残基连接前后 k 个）
+        L = SEQ_MAX_LEN
+        k = 10
+        edge_list = []
+        for b in range(B):
+            offset = b * L
+            for i in range(L):
+                for j in range(max(0, i-k), min(L, i+k+1)):
+                    if i != j:
+                        edge_list.append([offset + i, offset + j])
+        
+        if len(edge_list) > 0:
+            edge_index_flat = torch.tensor(edge_list, dtype=torch.long, device=device).t()
+        else:
+            edge_index_flat = torch.empty((2, 0), dtype=torch.long, device=device)
+        
+        # EGNN 前向
+        h = self.node_proj(coords_batch)
+        for layer in self.egnn_layers:
+            h, coords_batch = layer(h, coords_batch, edge_index_flat)
+        h = self.norm(h)
+
+        # Pool per graph
+        score = self.attn_pool(h).squeeze(-1)
+        out = torch.zeros(B, h.size(-1), device=device, dtype=h.dtype)
+        for b in range(B):
+            start_idx = b * L
+            end_idx = (b + 1) * L
+            idx = torch.arange(start_idx, end_idx, device=device)
+            w = torch.softmax(score[idx], dim=0)
+            out[b] = (h[idx] * w.unsqueeze(-1)).sum(dim=0)
+        return out
 
 # =========================
 # 双模态融合
@@ -585,14 +761,15 @@ class Classifier(nn.Module):
         return self.net(x).squeeze(-1)
 
 # =========================
-# 主模型
+# 主模型（四模态：2D图 + ESM序列 + 3D结构 + Bigram）
 # =========================
 class PepToxModel(nn.Module):
     def __init__(self, emb_matrix: np.ndarray, esm_model=None):
         super().__init__()
         self.graph  = GraphEncoder()
-        self.seqenc = ConvNeXtSequenceEncoder(emb_matrix, d_model=MODEL_DIM)
+        self.seqenc = xLSTMSequenceEncoder(emb_matrix, d_model=MODEL_DIM)
         self.esmenc = ESMSeqEncoder(esm_model)
+        self.struct = StructureEncoder(d_model=MODEL_DIM)  # 新增 3D 结构
         self.cross  = BiCrossAttention(d_model=MODEL_DIM, heads=4, layers=3)
         self.fusion = AttnFusion(d_model=MODEL_DIM)
         self.cls    = Classifier(d_model=MODEL_DIM)
@@ -610,7 +787,13 @@ class PepToxModel(nn.Module):
 
         g_vec_ca, s_vec_ca = self.cross(g_tokens, g_mask, esm_tokens)
 
-        tokens = torch.stack([g_global, g_vec_ca, esm_vec, s_vec, s_vec_ca], dim=1)
+        # 3D 结构编码（如果有坐标）
+        if hasattr(data, 'coords_3d'):
+            struct_vec = self.struct(data.coords_3d, data.batch, None)
+        else:
+            struct_vec = torch.zeros(B, MODEL_DIM, device=g_global.device)
+
+        tokens = torch.stack([g_global, g_vec_ca, esm_vec, s_vec, s_vec_ca, struct_vec], dim=1)
         fused  = self.fusion(tokens)
         return fused
 
@@ -721,6 +904,19 @@ def feature_mixup(feat, y, alpha=MIXUP_ALPHA):
     idx = torch.randperm(feat.size(0), device=feat.device)
     return lam * feat + (1 - lam) * feat[idx], lam * y + (1 - lam) * y[idx]
 
+def rdrop_loss(model, batch, criterion, alpha=RDROP_ALPHA):
+    """R-Drop 正则：两次前向传播 + KL 散度"""
+    logits1 = model(batch)
+    logits2 = model(batch)
+    loss1 = criterion(logits1, batch.y)
+    loss2 = criterion(logits2, batch.y)
+    # KL 散度对称
+    p1 = torch.sigmoid(logits1)
+    p2 = torch.sigmoid(logits2)
+    kl = F.kl_div(torch.log(p1.clamp(1e-8)), p2.detach(), reduction='batchmean') + \
+         F.kl_div(torch.log(p2.clamp(1e-8)), p1.detach(), reduction='batchmean')
+    return 0.5 * (loss1 + loss2) + alpha * 0.5 * kl
+
 def predict_mc_dropout(model, loader, T, n_passes=10):
     model.train()
     all_passes = []
@@ -781,20 +977,44 @@ def run_single_fold():
     w2v_path = f'outmodel/full/{DATASET}_fold{FOLD}_w2v_bigram.model'
     tok2idx, emb_mat = train_cbow_embeddings(df_train['SEQUENCE'].tolist(), w2v_path)
 
+    # 3.5) ESMFold 预测 3D 结构（可选，耗时较长）
+    struct_cache_tr = f'outcache/struct_{DATASET}_fold{FOLD}_train.pkl'
+    struct_cache_te = f'outcache/struct_{DATASET}_fold{FOLD}_test.pkl'
+    
+    if os.path.exists(struct_cache_tr) and os.path.exists(struct_cache_te):
+        print('[ESMFold] 使用缓存')
+        with open(struct_cache_tr, 'rb') as f:
+            coords_tr = pickle.load(f)
+        with open(struct_cache_te, 'rb') as f:
+            coords_te = pickle.load(f)
+    else:
+        print('[ESMFold] 预测 3D 结构（首次运行较慢）...')
+        esmfold = load_esmfold().to(DEVICE)
+        coords_tr = predict_structure_batch(esmfold, df_train['SEQUENCE'].tolist(), DEVICE)
+        coords_te = predict_structure_batch(esmfold, df_test['SEQUENCE'].tolist(), DEVICE)
+        with open(struct_cache_tr, 'wb') as f:
+            pickle.dump(coords_tr, f)
+        with open(struct_cache_te, 'wb') as f:
+            pickle.dump(coords_te, f)
+        del esmfold
+        torch.cuda.empty_cache()
+
     # 4) Dataset & DataLoader
     ds_train = GraphSeqDataset(
         df_train, comp_tr, edges_tr, y_tr, tok2idx,
         esm_tok_to_idx=esm_tok_to_idx, esm_pad_idx=esm_pad_idx,
         esm_bos_idx=esm_bos_idx, esm_eos_idx=esm_eos_idx,
         res_emb=(cache_tr['emb'] if cache_tr else None),
-        res_len=(cache_tr['len'] if cache_tr else None)
+        res_len=(cache_tr['len'] if cache_tr else None),
+        coords_3d=coords_tr
     )
     ds_test = GraphSeqDataset(
         df_test, comp_te, edges_te, y_te, tok2idx,
         esm_tok_to_idx=esm_tok_to_idx, esm_pad_idx=esm_pad_idx,
         esm_bos_idx=esm_bos_idx, esm_eos_idx=esm_eos_idx,
         res_emb=(cache_te['emb'] if cache_te else None),
-        res_len=(cache_te['len'] if cache_te else None)
+        res_len=(cache_te['len'] if cache_te else None),
+        coords_3d=coords_te
     )
     loader_train = DataLoader(ds_train, batch_size=BATCH_SIZE, shuffle=True,  drop_last=False)
     loader_test  = DataLoader(ds_test,  batch_size=BATCH_SIZE, shuffle=False, drop_last=False)
@@ -813,6 +1033,22 @@ def run_single_fold():
     scaler    = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
     ema       = EMA(model, decay=EMA_DECAY)
 
+    # SWA 设置
+    from torch.optim.swa_utils import AveragedModel, SWALR
+    swa_model = AveragedModel(model)
+    swa_start = int(EPOCHS * SWA_START_RATIO)
+    swa_scheduler = SWALR(optimizer, swa_lr=SWA_LR, anneal_epochs=5)
+    swa_active = False
+
+    # Cosine Annealing with Warmup
+    def lr_lambda(epoch):
+        if epoch < WARMUP_EPOCHS:
+            return (epoch + 1) / WARMUP_EPOCHS
+        progress = (epoch - WARMUP_EPOCHS) / max(1, EPOCHS - WARMUP_EPOCHS)
+        return 0.05 + 0.95 * 0.5 * (1 + math.cos(math.pi * progress))
+    
+    scheduler = LambdaLR(optimizer, lr_lambda)
+
     best_score  = -1.0
     best_path   = f'outmodel/full/{DATASET}_fold{FOLD}_best.pt'
     patience    = PATIENCE
@@ -824,7 +1060,13 @@ def run_single_fold():
         if epoch == 6:
             model.seqenc.embedding.weight.requires_grad = True
 
+        # 启用 SWA
+        if epoch >= swa_start and not swa_active:
+            swa_active = True
+            print(f'[SWA] 启动 @ epoch {epoch}')
+
         model.train()
+        ds_train.training_mode = True  # 启用 token dropout
         train_losses = []
         for batch in loader_train:
             batch = batch.to(DEVICE)
@@ -834,6 +1076,8 @@ def run_single_fold():
                     feat = model.encode(batch)
                     feat_mix, y_mix = feature_mixup(feat, batch.y)
                     loss = criterion(model.cls(feat_mix), y_mix)
+                elif RDROP_ALPHA > 0 and random.random() < 0.5:
+                    loss = rdrop_loss(model, batch, criterion)
                 else:
                     loss = criterion(model(batch), batch.y)
             scaler.scale(loss).backward()
@@ -843,7 +1087,15 @@ def run_single_fold():
             train_losses.append(loss.item())
             ema.update(model)
 
-        # ── 验证（EMA权重）──
+        # 更新学习率和 SWA
+        if swa_active:
+            swa_model.update_parameters(model)
+            swa_scheduler.step()
+        else:
+            scheduler.step()
+
+        ds_train.training_mode = False  # 关闭 token dropout        # ── 验证（EMA权重）──
+        ds_train.training_mode = False  # 关闭 token dropout
         model.eval()
         ema.apply(model)
         val_logits_list, val_true = [], []
@@ -867,19 +1119,13 @@ def run_single_fold():
 
         val_probs = torch.sigmoid(torch.from_numpy(val_logits) / T).numpy()
 
-        # ── 修改1：AnOxPePred 用阈值搜索，其他数据集固定 0.4 ──
-        if DATASET == 'AnOxPePred':
-            thr = find_best_threshold(val_true, val_probs, mode='mcc', min_sp=MIN_SP_FOR_THR)
-        else:
-            thr = 0.4
+        # 所有数据集都做阈值搜索
+        thr = find_best_threshold(val_true, val_probs, mode='mcc', min_sp=MIN_SP_FOR_THR)
 
         metrics = compute_metrics(val_true, val_probs, threshold=thr)
 
-        # ── 修改2：AnOxPePred 早停监控 MCC，其他数据集监控 AUROC+AUPRC ──
-        if DATASET == 'AnOxPePred':
-            val_score = metrics['MCC']
-        else:
-            val_score = 0.5 * (metrics['AUROC'] + metrics['AUPRC'])
+        # 早停监控：统一用组合指标
+        val_score = 0.4 * metrics['AUROC'] + 0.3 * metrics['MCC'] + 0.3 * metrics['F1']
 
         print(f'Epoch {epoch:02d} | Loss {np.mean(train_losses):.4f} | '
               f'AUROC {metrics["AUROC"]:.4f} AUPRC {metrics["AUPRC"]:.4f} '
@@ -915,16 +1161,24 @@ def run_single_fold():
     best_thresh = float(meta.get('thr', best_thresh))
     best_T      = float(np.clip(meta.get('temp', best_T), T_MIN, T_MAX))
 
-    model.eval()
+    # 如果启用了 SWA，更新 BN 统计量
+    if swa_active:
+        print('[SWA] 更新 BatchNorm 统计量...')
+        torch.optim.swa_utils.update_bn(loader_train, swa_model, device=DEVICE)
+        eval_model = swa_model
+    else:
+        eval_model = model
+
+    eval_model.eval()
     if N_MC_TEST and N_MC_TEST > 1:
-        test_probs = predict_mc_dropout(model, loader_test, best_T, n_passes=N_MC_TEST)
+        test_probs = predict_mc_dropout(eval_model, loader_test, best_T, n_passes=N_MC_TEST)
     else:
         probs_list = []
         with torch.no_grad():
             for batch in loader_test:
                 batch = batch.to(DEVICE)
                 with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                    prob = torch.sigmoid(model(batch) / best_T)
+                    prob = torch.sigmoid(eval_model(batch) / best_T)
                 probs_list.append(prob.cpu().numpy())
         test_probs = np.concatenate(probs_list)
 
